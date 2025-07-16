@@ -297,7 +297,7 @@ class UncertaintyEstimationLayer(nn.Module):
                                      self.bias_logvar.exp())
             return weight_kl + bias_kl
         else:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0, device=self.linear.weight.device if hasattr(self, 'linear') else 'cpu')
 
 
 class GFAN(nn.Module):
@@ -314,146 +314,170 @@ class GFAN(nn.Module):
                  n_classes: int = 2,
                  sparsity_reg: float = 0.01,
                  dropout_rate: float = 0.1,
-                 uncertainty_estimation: bool = True,
+                 uncertainty_method: Optional[str] = 'mc_dropout',
                  fusion_method: str = 'attention'):
         """
         Initialize GFAN model
         
         Args:
             n_channels: Number of EEG channels
-            spectral_features_dims: Dimensions of spectral features for each scale
+            spectral_features_dims: List of feature dimensions for each spectral scale
             eigenvalues: Graph Laplacian eigenvalues
             eigenvectors: Graph Laplacian eigenvectors
-            hidden_dims: Hidden layer dimensions
+            hidden_dims: List of hidden dimensions for GFAN layers
             n_classes: Number of output classes
             sparsity_reg: Sparsity regularization coefficient
             dropout_rate: Dropout rate
-            uncertainty_estimation: Whether to use uncertainty estimation
+            uncertainty_method: Method for uncertainty estimation ('mc_dropout', 'variational', None)
             fusion_method: Multi-scale fusion method
         """
         super(GFAN, self).__init__()
         
-        self.n_channels = n_channels
-        self.n_classes = n_classes
-        self.uncertainty_estimation = uncertainty_estimation
+        self.n_scales = len(spectral_features_dims)
+        self.uncertainty_method = uncertainty_method
         
-        # Multi-scale GFAN layers
+        # Input projection layers for each scale
+        self.input_projections = nn.ModuleList([
+            nn.Linear(dim, hidden_dims[0]) for dim in spectral_features_dims
+        ])
+        
+        # GFAN layers
         self.gfan_layers = nn.ModuleList()
-        for i, feat_dim in enumerate(spectral_features_dims):
-            layer = GFANLayer(
-                feat_dim, hidden_dims[0],
-                eigenvalues, eigenvectors,
-                sparsity_reg, dropout_rate
+        for i in range(len(hidden_dims) - 1):
+            self.gfan_layers.append(
+                GFANLayer(
+                    hidden_dims[i], hidden_dims[i+1],
+                    eigenvalues, eigenvectors,
+                    sparsity_reg, dropout_rate
+                )
             )
-            self.gfan_layers.append(layer)
         
         # Multi-scale fusion
-        self.fusion = MultiScaleFusion(
-            [hidden_dims[0]] * len(spectral_features_dims),
-            hidden_dim=hidden_dims[0],
+        self.fusion_layer = MultiScaleFusion(
+            [hidden_dims[-1]] * self.n_scales,
             fusion_method=fusion_method
         )
         
-        # Additional GFAN layers
-        self.additional_gfan_layers = nn.ModuleList()
-        current_dim = self.fusion.output_dim
-        
-        for hidden_dim in hidden_dims[1:]:
-            layer = GFANLayer(
-                current_dim, hidden_dim,
-                eigenvalues, eigenvectors,
-                sparsity_reg, dropout_rate
-            )
-            self.additional_gfan_layers.append(layer)
-            current_dim = hidden_dim
-        
-        # Global pooling
-        self.global_pool = nn.AdaptiveAvgPool1d(1)
-        
-        # Classification head
-        if uncertainty_estimation:
+        # Classifier
+        classifier_in_features = self.fusion_layer.output_dim
+        if uncertainty_method:
             self.classifier = UncertaintyEstimationLayer(
-                current_dim, n_classes, 'mc_dropout'
+                classifier_in_features, n_classes, uncertainty_method
             )
         else:
-            self.classifier = nn.Linear(current_dim, n_classes)
+            self.classifier = nn.Linear(classifier_in_features, n_classes)
     
     def forward(self, multi_scale_features: List[torch.Tensor],
-                return_uncertainty: bool = False) -> Dict[str, torch.Tensor]:
+                return_uncertainty: bool = False, n_mc_samples: int = 10) -> Dict[str, torch.Tensor]:
         """
-        Forward pass through GFAN
+        Forward pass through GFAN model
         
         Args:
-            multi_scale_features: List of spectral features for each scale
+            multi_scale_features: List of features from different scales
             return_uncertainty: Whether to return uncertainty estimates
+            n_mc_samples: Number of samples for MC dropout
             
         Returns:
-            Dictionary containing predictions and optional uncertainty
+            Dictionary with logits, sparsity loss, and optionally uncertainty
         """
-        # Apply GFAN layers to each scale
-        gfan_outputs = []
-        sparsity_losses = []
+        scale_outputs = []
+        total_sparsity_loss = 0
         
-        for i, features in enumerate(multi_scale_features):
-            output = self.gfan_layers[i](features)
-            gfan_outputs.append(output)
-            sparsity_losses.append(self.gfan_layers[i].get_sparsity_loss())
+        # Process each scale through GFAN layers
+        for i in range(self.n_scales):
+            # Project input features
+            x = self.input_projections[i](multi_scale_features[i])
+            
+            # Pass through GFAN layers
+            for layer in self.gfan_layers:
+                x = layer(x)
+                total_sparsity_loss += layer.get_sparsity_loss()
+            
+            scale_outputs.append(x)
         
         # Fuse multi-scale features
-        fused_features = self.fusion(gfan_outputs)
+        fused_features = self.fusion_layer(scale_outputs)
         
-        # Apply additional GFAN layers
-        x = fused_features
-        for layer in self.additional_gfan_layers:
-            x = layer(x)
-            sparsity_losses.append(layer.get_sparsity_loss())
+        # Global average pooling
+        pooled_features = torch.mean(fused_features, dim=1)
         
-        # Global pooling across nodes
-        x = x.transpose(1, 2)  # [batch_size, features, nodes]
-        x = self.global_pool(x).squeeze(2)  # [batch_size, features]
-        
-        # Classification
-        if return_uncertainty and self.uncertainty_estimation:
-            # Multiple forward passes for uncertainty estimation
-            predictions = []
-            for _ in range(10):  # Monte Carlo samples
-                pred = self.classifier(x, training=True)
-                predictions.append(pred)
+        # Classifier and uncertainty estimation
+        if self.uncertainty_method and (return_uncertainty or self.training):
+            if self.uncertainty_method == 'mc_dropout':
+                # Monte Carlo dropout
+                mc_outputs = []
+                for _ in range(n_mc_samples):
+                    mc_outputs.append(self.classifier(pooled_features))
+                
+                logits_stack = torch.stack(mc_outputs)
+                logits = torch.mean(logits_stack, dim=0)
+                uncertainty = torch.var(logits_stack, dim=0)
             
-            predictions = torch.stack(predictions, dim=0)  # [samples, batch, classes]
-            mean_pred = torch.mean(predictions, dim=0)
-            uncertainty = torch.var(predictions, dim=0)
-            
-            output = {
-                'logits': mean_pred,
-                'uncertainty': uncertainty,
-                'sparsity_loss': sum(sparsity_losses)
-            }
+            elif self.uncertainty_method == 'variational':
+                logits = self.classifier(pooled_features)
+                # Uncertainty from variance is more complex, often estimated via sampling
+                # For simplicity, we can use MC sampling here as well
+                mc_outputs = [self.classifier(pooled_features) for _ in range(n_mc_samples)]
+                uncertainty = torch.var(torch.stack(mc_outputs), dim=0)
         else:
-            logits = self.classifier(x)
-            output = {
-                'logits': logits,
-                'sparsity_loss': sum(sparsity_losses)
-            }
+            logits = self.classifier(pooled_features)
+            uncertainty = None
+
+        # Prepare output dictionary
+        output = {
+            'logits': logits,
+            'sparsity_loss': total_sparsity_loss / len(self.gfan_layers) if self.gfan_layers else 0,
+        }
         
+        if self.uncertainty_method == 'variational':
+            output['kl_loss'] = self.classifier.get_kl_loss()
+            
+        if uncertainty is not None:
+            output['uncertainty'] = uncertainty
+            
         return output
     
     def get_eigenmode_attribution(self, multi_scale_features: List[torch.Tensor]) -> torch.Tensor:
         """
-        Get attribution of different eigenmodes for interpretability
-        
-        Args:
-            multi_scale_features: Input features
-            
-        Returns:
-            Eigenmode attribution weights
+        Get eigenmode attribution weights using gradient-based analysis.
+        This method computes the gradient of the model's output with respect
+        to the spectral weights to determine their importance.
         """
+        self.train() # Ensure model is in training mode to get gradients
+        
+        # Ensure spectral weights require gradients
+        for layer in self.gfan_layers:
+            layer.fourier_layer.spectral_weights.requires_grad_(True)
+
+        # Zero out any existing gradients
+        self.zero_grad()
+
+        # Forward pass to get logits
+        outputs = self.forward(multi_scale_features, return_uncertainty=False)
+        logits = outputs['logits']
+        
+        # Use the logit of the predicted class as the score for attribution
+        predicted_class_logit = logits.max(dim=1)[0]
+        
+        # Backward pass to compute gradients of the score w.r.t. model parameters
+        # We use a gradient of 1 for the predicted class logit
+        predicted_class_logit.sum().backward()
+        
+        # Collect the gradients from the spectral weights of each GFAN layer
         attributions = []
+        for layer in self.gfan_layers:
+            if layer.fourier_layer.spectral_weights.grad is not None:
+                # Use the absolute value of the gradient as the attribution
+                attributions.append(layer.fourier_layer.spectral_weights.grad.abs().detach().clone())
         
-        for i, layer in enumerate(self.gfan_layers):
-            weights = layer.fourier_layer.spectral_weights
-            attributions.append(weights.detach())
+        # Zero gradients again to clean up
+        self.zero_grad()
+        self.eval() # Return model to evaluation mode
+
+        if not attributions:
+            return torch.zeros_like(self.gfan_layers[0].fourier_layer.spectral_weights)
+
+        # Average the attributions across all layers
+        mean_attributions = torch.mean(torch.stack(attributions), dim=0)
         
-        # Average across scales
-        mean_attribution = torch.stack(attributions).mean(dim=0)
-        return mean_attribution
+        return mean_attributions

@@ -3,19 +3,22 @@ Training pipeline for GFAN model
 Includes loss functions, optimization, and validation strategies
 """
 
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-import numpy as np
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-from sklearn.model_selection import LeaveOneGroupOut
-import matplotlib.pyplot as plt
-import seaborn as sns
+from sklearn.model_selection import LeaveOneGroupOut, train_test_split
 from tqdm import tqdm
-import os
-import json
 from typing import Dict, List, Tuple, Optional
+import matplotlib.pyplot as plt
+import json
+
+from src.spectral_decomposition import SpectralAugmentation
+from src.gfan_model import GFAN
+from src.evaluation import GFANEvaluator, post_process_predictions, find_optimal_threshold
 
 
 class EEGDataset(Dataset):
@@ -24,7 +27,7 @@ class EEGDataset(Dataset):
     """
     
     def __init__(self, windows, labels, spectral_features, subjects=None, 
-                 augmentation=None):
+                 augmentation: Optional[SpectralAugmentation] = None, training: bool = False):
         """
         Initialize EEG dataset
         
@@ -34,12 +37,14 @@ class EEGDataset(Dataset):
             spectral_features: Multi-scale spectral features
             subjects: Subject IDs for each sample
             augmentation: Data augmentation function
+            training: Flag to indicate if dataset is for training (enables augmentation)
         """
         self.windows = torch.tensor(windows, dtype=torch.float32)
         self.labels = torch.tensor(labels, dtype=torch.long)
         self.spectral_features = spectral_features
         self.subjects = subjects
         self.augmentation = augmentation
+        self.training = training
     
     def __len__(self):
         return len(self.windows)
@@ -48,17 +53,22 @@ class EEGDataset(Dataset):
         window = self.windows[idx]
         label = self.labels[idx]
         
-        # Get spectral features for this sample
-        features = []
-        for scale_features in self.spectral_features:
-            if isinstance(scale_features, list):
-                features.append(scale_features[idx])
-            else:
-                features.append(scale_features[idx])
+        # Get spectral features for this sample (magnitudes from STFT)
+        # Assuming spectral_features is a list of tensors, one for each scale
+        features = [scale_features[idx] for scale_features in self.spectral_features]
         
-        # Apply augmentation if specified
+        # Apply augmentation if specified and in training mode
         if self.augmentation is not None and self.training:
-            window, features = self.augmentation(window, features)
+            # Augment each scale's spectral features (magnitude)
+            augmented_features = []
+            for feature_magnitude in features:
+                # The augment_stft returns a dictionary, we need the magnitude
+                # Assuming augmentation works on numpy arrays
+                augmented_magnitude = self.augmentation.augment_stft(
+                    {'magnitude': feature_magnitude.numpy()}
+                )['magnitude']
+                augmented_features.append(torch.from_numpy(augmented_magnitude))
+            features = augmented_features
         
         sample = {
             'window': window,
@@ -94,7 +104,8 @@ class GFANTrainer:
     """
     
     def __init__(self, model, device='cuda', learning_rate=1e-3, 
-                 weight_decay=1e-4, class_weights=None, sparsity_weight=0.01):
+                 weight_decay=1e-4, class_weights=None, sparsity_weight=0.01,
+                 kl_weight=1e-5):
         """
         Initialize trainer
         
@@ -105,10 +116,12 @@ class GFANTrainer:
             weight_decay: Weight decay for regularization
             class_weights: Weights for handling class imbalance
             sparsity_weight: Weight for sparsity regularization
+            kl_weight: Weight for KL divergence loss (for variational inference)
         """
         self.model = model.to(device)
         self.device = device
         self.sparsity_weight = sparsity_weight
+        self.kl_weight = kl_weight
         
         # Optimizer
         self.optimizer = optim.AdamW(
@@ -152,13 +165,21 @@ class GFANTrainer:
             
             # Forward pass
             self.optimizer.zero_grad()
-            outputs = self.model(spectral_features)
+            outputs = self.model(spectral_features, return_uncertainty=False)
             
             # Compute loss
             focal_loss = self.criterion(outputs['logits'], labels)
             sparsity_loss = self.sparsity_weight * outputs['sparsity_loss']
+            
             total_loss_batch = focal_loss + sparsity_loss
             
+            # Add KL loss if applicable
+            if 'kl_loss' in outputs:
+                kl_loss = self.kl_weight * outputs['kl_loss']
+                total_loss_batch += kl_loss
+            else:
+                kl_loss = torch.tensor(0.0)
+
             # Backward pass
             total_loss_batch.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -174,7 +195,8 @@ class GFANTrainer:
             progress_bar.set_postfix({
                 'loss': total_loss_batch.item(),
                 'focal': focal_loss.item(),
-                'sparsity': sparsity_loss.item()
+                'sparsity': sparsity_loss.item(),
+                'kl': kl_loss.item()
             })
         
         # Compute epoch metrics
@@ -200,12 +222,15 @@ class GFANTrainer:
                 labels = batch['label'].to(self.device)
                 
                 # Forward pass
-                outputs = self.model(spectral_features)
+                outputs = self.model(spectral_features, return_uncertainty=True)
                 
                 # Compute loss
                 focal_loss = self.criterion(outputs['logits'], labels)
                 sparsity_loss = self.sparsity_weight * outputs['sparsity_loss']
                 total_loss_batch = focal_loss + sparsity_loss
+
+                if 'kl_loss' in outputs:
+                    total_loss_batch += self.kl_weight * outputs['kl_loss']
                 
                 total_loss += total_loss_batch.item()
                 
@@ -246,63 +271,40 @@ class GFANTrainer:
         Complete training loop
         """
         os.makedirs(save_dir, exist_ok=True)
-        best_val_f1 = 0
+        best_val_sensitivity = 0
         patience = 20
         patience_counter = 0
         
         for epoch in range(epochs):
-            print(f"\nEpoch {epoch + 1}/{epochs}")
-            
-            # Training
             train_loss, train_metrics = self.train_epoch(train_loader)
-            self.train_losses.append(train_loss)
-            self.train_metrics.append(train_metrics)
-            
-            # Validation
             val_loss, val_metrics = self.validate_epoch(val_loader)
+            
+            self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
+            self.train_metrics.append(train_metrics)
             self.val_metrics.append(val_metrics)
             
-            # Learning rate scheduling
-            self.scheduler.step()
+            print(f"Epoch {epoch+1}/{epochs} | "
+                  f"Train Loss: {train_loss:.4f} | Train F1: {train_metrics['f1']:.4f} | "
+                  f"Val Loss: {val_loss:.4f} | Val F1: {val_metrics['f1']:.4f} | "
+                  f"Val Sensitivity: {val_metrics['sensitivity']:.4f}")
             
-            # Print metrics
-            print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-            print(f"Train F1: {train_metrics['f1']:.4f}, Val F1: {val_metrics['f1']:.4f}")
-            print(f"Val Sensitivity: {val_metrics['sensitivity']:.4f}, Val Specificity: {val_metrics['specificity']:.4f}")
-            if 'auc' in val_metrics:
-                print(f"Val AUC: {val_metrics['auc']:.4f}")
-            
-            # Save best model
-            if val_metrics['f1'] > best_val_f1:
-                best_val_f1 = val_metrics['f1']
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'val_f1': best_val_f1,
-                    'val_metrics': val_metrics
-                }, os.path.join(save_dir, 'best_model.pth'))
+            # Early stopping and model saving based on sensitivity
+            if val_metrics['sensitivity'] > best_val_sensitivity:
+                best_val_sensitivity = val_metrics['sensitivity']
+                torch.save(self.model.state_dict(), os.path.join(save_dir, 'best_model.pth'))
+                print(f"New best model saved with validation sensitivity: {best_val_sensitivity:.4f}")
                 patience_counter = 0
             else:
                 patience_counter += 1
+                if patience_counter >= patience:
+                    print("Early stopping triggered.")
+                    break
             
-            # Early stopping
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch + 1}")
-                break
-            
-            # Save checkpoint
-            if (epoch + 1) % 10 == 0:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'train_losses': self.train_losses,
-                    'val_losses': self.val_losses,
-                    'train_metrics': self.train_metrics,
-                    'val_metrics': self.val_metrics
-                }, os.path.join(save_dir, f'checkpoint_epoch_{epoch + 1}.pth'))
+            self.scheduler.step()
+        
+        print("Training finished.")
+        return os.path.join(save_dir, 'best_model.pth')
     
     def plot_training_history(self, save_path=None):
         """
@@ -380,94 +382,112 @@ class LeaveOneSubjectOutValidator:
             graph_info: Graph structure information
             n_folds: Number of folds (None for all subjects)
         """
-        subjects = np.unique(dataset.subjects)
-        if n_folds is not None:
-            subjects = subjects[:n_folds]
+        subjects = np.array([s['subject'] for s in dataset])
+        windows = np.array([s['window'].numpy() for s in dataset])
+        labels = np.array([s['label'].numpy() for s in dataset])
         
         logo = LeaveOneGroupOut()
         
-        for fold, (train_idx, val_idx) in enumerate(logo.split(
-            dataset.windows, dataset.labels, dataset.subjects)):
+        if n_folds is None:
+            n_folds = logo.get_n_splits(groups=subjects)
             
-            if fold >= len(subjects):
+        for fold, (train_val_idx, test_idx) in enumerate(logo.split(windows, labels, groups=subjects)):
+            if fold >= n_folds:
                 break
-                
-            print(f"\n=== Fold {fold + 1}/{len(subjects)} ===")
-            print(f"Test subject: {subjects[fold]}")
             
-            # Create train and validation datasets
+            print(f"\n----- Fold {fold+1}/{n_folds} -----")
+            
+            # Split train_val into train and validation
+            train_idx, val_idx = train_test_split(
+                train_val_idx, test_size=0.2, stratify=labels[train_val_idx], 
+                random_state=42, groups=subjects[train_val_idx]
+            )
+
             train_dataset = self.create_subset(dataset, train_idx)
             val_dataset = self.create_subset(dataset, val_idx)
-            
-            # Create data loaders
-            train_loader = DataLoader(
-                train_dataset, batch_size=32, shuffle=True, num_workers=4
+            test_dataset = self.create_subset(dataset, test_idx)
+
+            # Create WeightedRandomSampler for training set
+            train_labels = [s['label'] for s in train_dataset]
+            class_counts = np.bincount(train_labels)
+            class_weights = 1. / class_counts
+            sample_weights = np.array([class_weights[l] for l in train_labels])
+            sampler = WeightedRandomSampler(
+                weights=torch.from_numpy(sample_weights).double(),
+                num_samples=len(sample_weights),
+                replacement=True
             )
-            val_loader = DataLoader(
-                val_dataset, batch_size=32, shuffle=False, num_workers=4
-            )
+
+            train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler)
+            val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+            test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
             
             # Initialize model and trainer
-            from .gfan_model import GFAN
-            model = GFAN(**self.model_config, **graph_info)
+            model = GFAN(
+                eigenvalues=graph_info['eigenvalues'],
+                eigenvectors=graph_info['eigenvectors'],
+                **self.model_config
+            )
             trainer = GFANTrainer(model, **self.trainer_config)
             
-            # Train
-            trainer.train(train_loader, val_loader, epochs=50)
+            # Train model
+            save_dir = f"checkpoints/fold_{fold+1}"
+            best_model_path = trainer.train(train_loader, val_loader, epochs=50, save_dir=save_dir)
             
-            # Evaluate
-            _, val_metrics = trainer.validate_epoch(val_loader)
-            val_metrics['fold'] = fold
-            val_metrics['test_subject'] = subjects[fold]
+            # Load best model
+            model.load_state_dict(torch.load(best_model_path))
             
-            self.results.append(val_metrics)
+            # Evaluate on test set
+            evaluator = GFANEvaluator(model, device=self.trainer_config.get('device', 'cuda'))
             
-            print(f"Fold {fold + 1} Results:")
-            for metric, value in val_metrics.items():
-                if isinstance(value, float):
-                    print(f"  {metric}: {value:.4f}")
+            # Find optimal threshold on validation set
+            val_results = evaluator.evaluate_model(val_loader, return_predictions=True)
+            optimal_threshold = find_optimal_threshold(
+                val_results['predictions']['labels'],
+                val_results['predictions']['probabilities']
+            )
+            print(f"Optimal threshold found on validation set: {optimal_threshold:.4f}")
+
+            # Evaluate on test set using optimal threshold
+            test_results = evaluator.evaluate_model(test_loader, return_predictions=True)
+            
+            # Post-process with optimal threshold
+            post_processed_results = post_process_predictions(
+                test_results['predictions'], threshold=optimal_threshold
+            )
+
+            fold_results = {
+                'fold': fold + 1,
+                'subject': np.unique(subjects[test_idx])[0],
+                'metrics': test_results['metrics'],
+                'post_processed_metrics': post_processed_results['event_metrics'],
+                'optimal_threshold': optimal_threshold
+            }
+            
+            self.results.append(fold_results)
+            print(f"Fold {fold+1} Test F1: {test_results['metrics']['f1']:.4f} | "
+                  f"Post-processed F1: {post_processed_results['event_metrics']['f1']:.4f}")
+
+        return self.results
     
     def create_subset(self, dataset, indices):
-        """
-        Create subset of dataset
-        """
-        subset_windows = dataset.windows[indices]
-        subset_labels = dataset.labels[indices]
-        subset_features = []
-        
-        for scale_features in dataset.spectral_features:
-            if isinstance(scale_features, torch.Tensor):
-                subset_features.append(scale_features[indices])
-            else:
-                subset_features.append([scale_features[i] for i in indices])
-        
-        subset_subjects = dataset.subjects[indices] if dataset.subjects is not None else None
-        
-        return EEGDataset(
-            subset_windows, subset_labels, subset_features, subset_subjects
-        )
+        return [dataset[i] for i in indices]
     
     def get_summary_metrics(self):
-        """
-        Get summary statistics across all folds
-        """
         if not self.results:
             return None
         
-        metrics_summary = {}
-        metric_names = ['accuracy', 'precision', 'recall', 'f1', 'sensitivity', 'specificity', 'auc']
+        summary = {}
+        for key in self.results[0]['metrics'].keys():
+            summary[key] = np.mean([r['metrics'][key] for r in self.results])
+            summary[f"{key}_std"] = np.std([r['metrics'][key] for r in self.results])
         
-        for metric in metric_names:
-            if metric in self.results[0]:
-                values = [r[metric] for r in self.results]
-                metrics_summary[metric] = {
-                    'mean': np.mean(values),
-                    'std': np.std(values),
-                    'min': np.min(values),
-                    'max': np.max(values)
-                }
-        
-        return metrics_summary
+        # Add post-processed summary
+        for key in self.results[0]['post_processed_metrics'].keys():
+            summary[f"post_{key}"] = np.mean([r['post_processed_metrics'][key] for r in self.results])
+            summary[f"post_{key}_std"] = np.std([r['post_processed_metrics'][key] for r in self.results])
+
+        return summary
     
     def save_results(self, save_path):
         """
