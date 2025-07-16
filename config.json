@@ -1,0 +1,139 @@
+{
+  "model_configs": {
+    "demo": {
+      "description": "Lightweight configuration for quick demonstration",
+      "n_channels": 18,
+      "hidden_dims": [32, 16],
+      "window_sizes": [2.0],
+      "sparsity_reg": 0.01,
+      "dropout_rate": 0.1,
+      "uncertainty_estimation": false,
+      "fusion_method": "concat",
+      "training": {
+        "epochs": 10,
+        "batch_size": 32,
+        "learning_rate": 0.001,
+        "early_stopping_patience": 10
+      }
+    },
+    "standard": {
+      "description": "Standard configuration for research evaluation",
+      "n_channels": 18,
+      "hidden_dims": [64, 32],
+      "window_sizes": [1.0, 2.0],
+      "sparsity_reg": 0.01,
+      "dropout_rate": 0.1,
+      "uncertainty_estimation": true,
+      "fusion_method": "attention",
+      "training": {
+        "epochs": 50,
+        "batch_size": 16,
+        "learning_rate": 0.001,
+        "early_stopping_patience": 20
+      }
+    },
+    "full": {
+      "description": "Full configuration for publication-quality results",
+      "n_channels": 18,
+      "hidden_dims": [128, 64, 32],
+      "window_sizes": [1.0, 2.0, 4.0],
+      "sparsity_reg": 0.01,
+      "dropout_rate": 0.1,
+      "uncertainty_estimation": true,
+      "fusion_method": "attention",
+      "training": {
+        "epochs": 100,
+        "batch_size": 16,
+        "learning_rate": 0.001,
+        "early_stopping_patience": 30
+      }
+    }
+  },
+  "data_configs": {
+    "demo": {
+      "description": "Small dataset for quick testing",
+      "n_subjects": 2,
+      "n_files_per_subject": 1,
+      "max_samples_per_file": 100
+    },
+    "medium": {
+      "description": "Medium dataset for validation",
+      "n_subjects": 5,
+      "n_files_per_subject": 3,
+      "max_samples_per_file": 500
+    },
+    "full": {
+      "description": "Complete dataset for full evaluation",
+      "n_subjects": null,
+      "n_files_per_subject": null,
+      "max_samples_per_file": null
+    }
+  },
+  "ablation_studies": {
+    "components": [
+      {
+        "name": "no_adaptive_basis",
+        "description": "Remove adaptive Fourier basis learning",
+        "changes": {
+          "sparsity_reg": 0,
+          "learnable_spectral_weights": false
+        }
+      },
+      {
+        "name": "single_scale",
+        "description": "Use only single-scale STFT",
+        "changes": {
+          "window_sizes": [2.0]
+        }
+      },
+      {
+        "name": "no_sparsity",
+        "description": "Remove sparsity regularization",
+        "changes": {
+          "sparsity_reg": 0
+        }
+      },
+      {
+        "name": "no_uncertainty",
+        "description": "Remove uncertainty estimation",
+        "changes": {
+          "uncertainty_estimation": false
+        }
+      },
+      {
+        "name": "simple_fusion",
+        "description": "Use simple concatenation instead of attention",
+        "changes": {
+          "fusion_method": "concat"
+        }
+      },
+      {
+        "name": "no_dropout",
+        "description": "Remove dropout regularization",
+        "changes": {
+          "dropout_rate": 0
+        }
+      }
+    ]
+  },
+  "evaluation_metrics": [
+    "accuracy",
+    "precision",
+    "recall",
+    "f1_score",
+    "sensitivity",
+    "specificity",
+    "auc_roc",
+    "auc_pr",
+    "false_positives_per_hour",
+    "cohen_kappa"
+  ],
+  "kaggle_settings": {
+    "gpu_enabled": true,
+    "memory_limit": "16GB",
+    "timeout": "12 hours",
+    "output_directory": "/kaggle/working",
+    "input_directory": "/kaggle/input",
+    "dataset_name": "chb-mit-scalp-eeg-database-1.0.0"
+  }
+}
