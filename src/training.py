@@ -57,8 +57,8 @@ class EEGDataset(Dataset):
         # Assuming spectral_features is a list of tensors, one for each scale
         features = [scale_features[idx] for scale_features in self.spectral_features]
         
-        # Apply augmentation if specified and in training mode
-        if self.augmentation is not None and self.training:
+        # Apply augmentation if specified, in training mode, and for the seizure class
+        if self.augmentation is not None and self.training and label == 1:
             # Augment each scale's spectral features (magnitude)
             augmented_features = []
             for feature_magnitude in features:
