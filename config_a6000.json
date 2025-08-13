@@ -1,0 +1,59 @@
+{
+    "data": {
+        "path": "chb-mit-scalp-eeg-database-1.0.0",
+        "target_fs": 256,
+        "window_size": 2.0,
+        "overlap": 0.5,
+        "n_subjects_to_process": null,
+        "max_files_per_subject": null,
+        "max_windows_per_file": null
+    },
+    "features": {
+        "window_sizes": [1.0, 2.0, 4.0],
+        "hop_ratio": 0.25,
+        "log_transform": true,
+        "batch_size_spectral": 128
+    },
+    "graph": {
+        "method": "hybrid",
+        "spatial_weight": 0.5,
+        "functional_weight": 0.5
+    },
+    "model": {
+        "n_channels": 18,
+        "spectral_features_dims": [129, 257, 513],
+        "hidden_dims": [512, 256, 128, 64],
+        "n_classes": 2,
+        "sparsity_reg": 0.01,
+        "dropout_rate": 0.2,
+        "uncertainty_method": "mc_dropout",
+        "fusion_method": "attention"
+    },
+    "trainer": {
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-5,
+        "class_weights": [1.0, 10.0],
+        "sparsity_weight": 0.01,
+        "kl_weight": 1e-6,
+        "epochs": 100,
+        "batch_size": 256,
+        "gradient_accumulation_steps": 2,
+        "mixed_precision": true,
+        "compile_model": true
+    },
+    "validation": {
+        "n_folds": null,
+        "mc_samples": 50
+    },
+    "hardware": {
+        "device": "cuda",
+        "gpu_memory_gb": 48,
+        "system_memory_gb": 256,
+        "enable_tf32": true,
+        "enable_cudnn_benchmark": true,
+        "enable_mixed_precision": true
+    },
+    "results_path": "results/a6000_full_dataset_run.json",
+    "checkpoints_path": "checkpoints/a6000_run",
+    "save_model_every_n_epochs": 10
+}

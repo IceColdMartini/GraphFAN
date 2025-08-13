@@ -100,14 +100,15 @@ class WeightedFocalLoss(nn.Module):
 
 class GFANTrainer:
     """
-    Training pipeline for GFAN model
+    Training pipeline for GFAN model optimized for A6000 GPU
     """
     
     def __init__(self, model, device='cuda', learning_rate=1e-3, 
                  weight_decay=1e-4, class_weights=None, sparsity_weight=0.01,
-                 kl_weight=1e-5):
+                 kl_weight=1e-5, batch_size=256, gradient_accumulation_steps=1,
+                 mixed_precision=True, compile_model=False):
         """
-        Initialize trainer
+        Initialize trainer with A6000 optimizations
         
         Args:
             model: GFAN model
@@ -117,22 +118,46 @@ class GFANTrainer:
             class_weights: Weights for handling class imbalance
             sparsity_weight: Weight for sparsity regularization
             kl_weight: Weight for KL divergence loss (for variational inference)
+            batch_size: Batch size for training
+            gradient_accumulation_steps: Steps for gradient accumulation
+            mixed_precision: Use automatic mixed precision
+            compile_model: Use torch.compile for optimization
         """
         self.model = model.to(device)
         self.device = device
         self.sparsity_weight = sparsity_weight
         self.kl_weight = kl_weight
+        self.batch_size = batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         
-        # Optimizer
+        # Enable A6000 optimizations
+        if compile_model and hasattr(torch, 'compile'):
+            self.model = torch.compile(self.model)
+            print("Model compiled for optimization")
+        
+        # Mixed precision setup
+        self.mixed_precision = mixed_precision
+        if mixed_precision:
+            self.scaler = torch.cuda.amp.GradScaler()
+            print("Mixed precision training enabled")
+        
+        # Optimizer with larger batch size considerations
         self.optimizer = optim.AdamW(
             model.parameters(), 
             lr=learning_rate, 
-            weight_decay=weight_decay
+            weight_decay=weight_decay,
+            eps=1e-8,
+            betas=(0.9, 0.999)
         )
         
-        # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=10, T_mult=2
+        # Learning rate scheduler optimized for longer training
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer, 
+            max_lr=learning_rate * 10,
+            total_steps=None,  # Will be set based on training length
+            pct_start=0.1,
+            div_factor=10,
+            final_div_factor=100
         )
         
         # Loss function
@@ -149,54 +174,88 @@ class GFANTrainer:
     
     def train_epoch(self, train_loader):
         """
-        Train for one epoch
+        Train for one epoch with A6000 optimizations
         """
         self.model.train()
         total_loss = 0
         all_predictions = []
         all_labels = []
         
+        # Initialize gradient accumulation
+        self.optimizer.zero_grad()
+        
         progress_bar = tqdm(train_loader, desc="Training")
         
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar):
             # Move data to device
             spectral_features = [f.to(self.device) for f in batch['spectral_features']]
             labels = batch['label'].to(self.device)
             
-            # Forward pass
-            self.optimizer.zero_grad()
-            outputs = self.model(spectral_features, return_uncertainty=False)
-            
-            # Compute loss
-            focal_loss = self.criterion(outputs['logits'], labels)
-            sparsity_loss = self.sparsity_weight * outputs['sparsity_loss']
-            
-            total_loss_batch = focal_loss + sparsity_loss
-            
-            # Add KL loss if applicable
-            if 'kl_loss' in outputs:
-                kl_loss = self.kl_weight * outputs['kl_loss']
-                total_loss_batch += kl_loss
+            # Mixed precision forward pass
+            if self.mixed_precision:
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(spectral_features, return_uncertainty=False)
+                    
+                    # Compute loss
+                    focal_loss = self.criterion(outputs['logits'], labels)
+                    sparsity_loss = self.sparsity_weight * outputs['sparsity_loss']
+                    total_loss_batch = focal_loss + sparsity_loss
+                    
+                    # Add KL loss if applicable
+                    if 'kl_loss' in outputs:
+                        kl_loss = self.kl_weight * outputs['kl_loss']
+                        total_loss_batch += kl_loss
+                    
+                    # Scale loss for gradient accumulation
+                    total_loss_batch = total_loss_batch / self.gradient_accumulation_steps
+                
+                # Backward pass with mixed precision
+                self.scaler.scale(total_loss_batch).backward()
             else:
-                kl_loss = torch.tensor(0.0)
-
-            # Backward pass
-            total_loss_batch.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+                # Standard precision training
+                outputs = self.model(spectral_features, return_uncertainty=False)
+                
+                # Compute loss
+                focal_loss = self.criterion(outputs['logits'], labels)
+                sparsity_loss = self.sparsity_weight * outputs['sparsity_loss']
+                total_loss_batch = focal_loss + sparsity_loss
+                
+                # Add KL loss if applicable
+                if 'kl_loss' in outputs:
+                    kl_loss = self.kl_weight * outputs['kl_loss']
+                    total_loss_batch += kl_loss
+                
+                # Scale loss for gradient accumulation
+                total_loss_batch = total_loss_batch / self.gradient_accumulation_steps
+                
+                # Backward pass
+                total_loss_batch.backward()
+            
+            # Gradient accumulation step
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                if self.mixed_precision:
+                    # Gradient clipping and optimization with mixed precision
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    # Standard gradient clipping and optimization
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
+                
+                self.optimizer.zero_grad()
             
             # Accumulate metrics
-            total_loss += total_loss_batch.item()
+            total_loss += total_loss_batch.item() * self.gradient_accumulation_steps
             predictions = torch.argmax(outputs['logits'], dim=1)
             all_predictions.extend(predictions.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
             
             # Update progress bar
             progress_bar.set_postfix({
-                'loss': total_loss_batch.item(),
-                'focal': focal_loss.item(),
-                'sparsity': sparsity_loss.item(),
-                'kl': kl_loss.item()
+                'Loss': f'{total_loss_batch.item() * self.gradient_accumulation_steps:.4f}',
+                'GPU_Mem': f'{torch.cuda.memory_allocated() / 1024**3:.1f}GB'
             })
         
         # Compute epoch metrics

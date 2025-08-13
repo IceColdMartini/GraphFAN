@@ -68,15 +68,35 @@ class MultiScaleSTFT:
         params = self.window_params[window_idx]
         n_channels, n_samples = signal_data.shape
         
+        # Check if nperseg is larger than signal length
+        nperseg = params['n_fft']
+        if nperseg > n_samples:
+            # Use the signal length as nperseg if it's smaller
+            nperseg = n_samples
+            hop_length = max(1, nperseg // 4)  # Use 25% hop
+        else:
+            hop_length = params['hop_length']
+        
         # Compute STFT for each channel
         stft_data = []
+        # Ensure noverlap is strictly less than nperseg
+        # scipy.signal.stft requires noverlap < nperseg
+        noverlap = nperseg - hop_length
+        
+        # Ensure noverlap is strictly less than nperseg
+        if noverlap >= nperseg:
+            noverlap = nperseg - 1
+        # Also ensure noverlap is non-negative
+        if noverlap < 0:
+            noverlap = 0
+        
         for ch in range(n_channels):
             f, t, Zxx = signal.stft(
                 signal_data[ch],
                 fs=self.fs,
                 window='hann',
-                nperseg=params['n_fft'],
-                noverlap=params['n_fft'] - params['hop_length'],
+                nperseg=nperseg,
+                noverlap=noverlap,
                 return_onesided=True
             )
             stft_data.append(Zxx)

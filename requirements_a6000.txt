@@ -1,0 +1,40 @@
+# A6000 Optimized Requirements for GFAN
+# PyTorch with CUDA 12.1 support for A6000
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# Core scientific computing
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# EEG data processing
+mne>=1.5.0
+pyedflib>=0.1.35
+
+# Signal processing and spectral analysis
+librosa>=0.10.0
+
+# Progress bars and visualization
+tqdm>=4.66.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.15.0
+
+# Memory profiling and optimization
+psutil>=5.9.0
+memory-profiler>=0.61.0
+
+# Configuration and logging
+pyyaml>=6.0
+wandb>=0.15.0  # For experiment tracking
+
+# CUDA optimizations (optional)
+nvidia-ml-py>=12.535.0
+
+# Development and testing
+pytest>=7.4.0
+black>=23.7.0
+isort>=5.12.0

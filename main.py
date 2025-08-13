@@ -24,12 +24,12 @@ def main():
     """
     # --- 1. Configuration ---
     config = {
-        'data': {
+                'data': {
             'path': 'chb-mit-scalable-eeg-database-1.0.0',
             'target_fs': 256,
             'window_size': 2.0,
             'overlap': 0.5,
-            'n_subjects_to_process': 3 # Set to None to process all subjects
+            'n_subjects_to_process': None  # Process ALL subjects with A6000's 48GB VRAM
         },
         'features': {
             'window_sizes': [1.0, 2.0, 4.0],
@@ -41,10 +41,8 @@ def main():
             'spatial_weight': 0.5,
             'functional_weight': 0.5
         },
-        'model': {
-            'n_channels': 18, # Will be updated based on data
-            'spectral_features_dims': [129, 257, 513], # Will be updated
-            'hidden_dims': [128, 64],
+                'model': {
+            'n_channels': 18,            'spectral_features_dims': [129, 257, 513],            'hidden_dims': [256, 128, 64],  # Increased capacity for A6000
             'n_classes': 2,
             'sparsity_reg': 0.01,
             'dropout_rate': 0.2,
@@ -57,21 +55,28 @@ def main():
             'class_weights': [1.0, 10.0], # Will be updated based on data
             'sparsity_weight': 0.01,
             'kl_weight': 1e-6,
-            'epochs': 50
+            'epochs': 100,  # Increased for full dataset training
+            'batch_size': 128,  # Larger batch size for A6000
+            'gradient_accumulation_steps': 4  # Effective batch size: 512
         },
         'validation': {
-            'n_folds': 3 # Set to None for full LOSO validation
+            'n_folds': None  # Full LOSO validation for complete evaluation
         },
         'results_path': 'results/final_run_summary.json'
     }
 
-    # --- 2. Device Setup ---
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using Apple Metal (MPS) for acceleration.")
+        # --- 2. Device Setup ---
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+        # Enable optimizations for A6000
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     else:
         device = torch.device("cpu")
-        print("MPS not available. Using CPU.")
+        print("CUDA not available. Using CPU.")
     config['trainer']['device'] = device
 
     # --- 3. Initialization ---
@@ -91,11 +96,13 @@ def main():
     all_spectral_features = [[] for _ in config['features']['window_sizes']]
     
     subject_dirs = sorted([d for d in glob.glob(os.path.join(config['data']['path'], 'chb*')) if os.path.isdir(d)])
-    if config['data']['n_subjects_to_process'] is not None:
-        subject_dirs = subject_dirs[:config['data']['n_subjects_to_process']]
+    # Process ALL subjects - no restrictions for A6000 environment
+    print(f"Processing ALL {len(subject_dirs)} subjects with full dataset...")
 
     print(f"Starting data processing for {len(subject_dirs)} subjects...")
     for subject_dir in tqdm(subject_dirs, desc="Processing Subjects"):
+        # Process all files and windows - no memory restrictions for A6000
+        pass  # Implementation details would go here
         subject_id = int(os.path.basename(subject_dir).replace('chb', ''))
         summary_file = os.path.join(subject_dir, f"{os.path.basename(subject_dir)}-summary.txt")
         annotations = load_chb_mit_annotations(summary_file)
